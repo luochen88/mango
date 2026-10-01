@@ -7,6 +7,7 @@
 #include "mango/manage/client.h"
 #include "mango/manage/misc.h"
 #include "mango/manage/monitor.h"
+#include "mango/manage/tab.h"
 #include "mango/overview/overview.h"
 #include <math.h>
 #include <stdint.h>
@@ -19,11 +20,6 @@
 #ifdef XWAYLAND
 #include <wlr/xwayland.h>
 #endif
-
-static bool client_gesture_driven(const Client *c) {
-	return server.gesture_drive_active && c &&
-		   c->mon == server.gesture_drive_mon;
-}
 
 static int32_t client_open_animation_type(const Client *c) {
 	return c->animation_type_open != ANIM_TYPE_UNSET
@@ -274,13 +270,26 @@ void buffer_set_effect(Client *c, BufferData data) {
 								   scene_buffer_apply_effect, &data);
 }
 
-void client_draw_groupbar(Client *c, struct ivec2 offsets) {
+void client_draw_group_bar(Client *c, struct ivec2 offsets) {
 	if (!c || !c->group_bar)
 		return;
 
 	if (!c->group_next && !c->group_prev) {
 		if (c->group_bar->scene->node.enabled)
 			wlr_scene_node_set_enabled(&c->group_bar->scene->node, false);
+		return;
+	}
+
+	/* Owner hidden by tab: hide the whole strip, otherwise its nodes (they are
+	 * not children of the window) would float over the visible window. */
+	if (c->is_tab_hidden) {
+		Client *head = c;
+		while (head->group_prev)
+			head = head->group_prev;
+		for (Client *cur = head; cur; cur = cur->group_next) {
+			if (cur->group_bar)
+				wlr_scene_node_set_enabled(&cur->group_bar->scene->node, false);
+		}
 		return;
 	}
 
@@ -434,7 +443,7 @@ void global_draw_group_bar(Client *c, int32_t x, int32_t y, int32_t width,
 		return;
 
 	wlr_scene_node_set_position(&c->group_bar->scene->node, x, y);
-	mango_group_bar_set_size(c->group_bar, width, height);
+	mango_bar_decoration_set_size(c->group_bar, width, height);
 }
 void client_draw_split_border(Client *c, bool hit_no_border,
 							  struct ivec2 offsets) {
@@ -603,11 +612,11 @@ struct ivec2 clip_to_hide(Client *c, struct wlr_box *clip_box,
 	if ((clip_box->width + bw <= 0 || clip_box->height + bw <= 0) &&
 		(ISSCROLLTILED(c) || c->animation.tagouting || c->animation.tagining)) {
 		c->is_clip_to_hide = true;
-		wlr_scene_node_set_enabled(&c->scene->node, false);
+		client_update_visibility(c);
 	} else if (c->is_clip_to_hide &&
 			   (VISIBLEON(c, c->mon) || client_gesture_driven(c))) {
 		c->is_clip_to_hide = false;
-		wlr_scene_node_set_enabled(&c->scene->node, true);
+		client_update_visibility(c);
 	}
 
 	return offset;
@@ -823,7 +832,8 @@ void client_apply_clip(Client *c, float factor) {
 
 		/* Decorations are drawn against the card geometry. */
 		client_draw_border(c, offsets);
-		client_draw_groupbar(c, offsets);
+		client_draw_group_bar(c, offsets);
+		client_draw_tabbar(c, offsets);
 		client_draw_shield(c, surface_clip_offset);
 		client_draw_dim(c, surface_clip_offset);
 
@@ -850,17 +860,15 @@ void client_apply_clip(Client *c, float factor) {
 		surface_clip_offset = clip_to_hide(c, &clip_box, offsets);
 
 		client_draw_border(c, offsets);
-		client_draw_groupbar(c, offsets);
+		client_draw_group_bar(c, offsets);
+		client_draw_tabbar(c, offsets);
 		client_draw_shield(c, surface_clip_offset);
 		client_draw_dim(c, surface_clip_offset);
 
-		if (clip_box.width <= 0 || clip_box.height <= 0) {
-			should_render_client_surface = false;
-			wlr_scene_node_set_enabled(&c->scene_surface->node, false);
-		} else {
-			should_render_client_surface = true;
-			wlr_scene_node_set_enabled(&c->scene_surface->node, true);
-		}
+		should_render_client_surface =
+			clip_box.width > 0 && clip_box.height > 0;
+		c->is_surface_hidden = !should_render_client_surface;
+		client_update_visibility(c);
 
 		if (!should_render_client_surface)
 			return;
@@ -901,7 +909,8 @@ void client_apply_clip(Client *c, float factor) {
 	surface_clip_offset = clip_to_hide(c, &clip_box, offsets);
 
 	client_draw_border(c, offsets);
-	client_draw_groupbar(c, offsets);
+	client_draw_group_bar(c, offsets);
+	client_draw_tabbar(c, offsets);
 	client_draw_shield(c, surface_clip_offset);
 	client_draw_dim(c, surface_clip_offset);
 	/* During animation, sync the X11 root surface dest_size / clipping
@@ -912,13 +921,9 @@ void client_apply_clip(Client *c, float factor) {
 	else
 		client_update_xwayland_dest_size(c);
 
-	if (clip_box.width <= 0 || clip_box.height <= 0) {
-		should_render_client_surface = false;
-		wlr_scene_node_set_enabled(&c->scene_surface->node, false);
-	} else {
-		should_render_client_surface = true;
-		wlr_scene_node_set_enabled(&c->scene_surface->node, true);
-	}
+	should_render_client_surface = clip_box.width > 0 && clip_box.height > 0;
+	c->is_surface_hidden = !should_render_client_surface;
+	client_update_visibility(c);
 
 	if (!should_render_client_surface)
 		return;
@@ -1057,7 +1062,7 @@ void client_animation_next_tick(Client *c) {
 
 		if (c->animation.tagouting) {
 			c->animation.tagouting = false;
-			wlr_scene_node_set_enabled(&c->scene->node, false);
+			client_update_visibility(c);
 			c->animation.tagouted = true;
 			c->animation.current = c->geom;
 			client_apply_clip(c, 1.0f);
@@ -1099,7 +1104,8 @@ void init_fadeout_client(Client *c) {
 	fadeout_client->animation_type_open = ANIM_TYPE_UNSET;
 	fadeout_client->animation_type_close = ANIM_TYPE_UNSET;
 
-	wlr_scene_node_set_enabled(&c->scene->node, true);
+	c->snapshot_temp_visible = true;
+	client_update_visibility(c);
 	client_set_border_color(c, config.bordercolor);
 	if (c->ov_card_tree) {
 		/*
@@ -1120,7 +1126,8 @@ void init_fadeout_client(Client *c) {
 		fadeout_client->scene =
 			wlr_scene_tree_snapshot(&c->scene->node, server.layers[LyrFadeOut]);
 	}
-	wlr_scene_node_set_enabled(&c->scene->node, false);
+	c->snapshot_temp_visible = false;
+	client_update_visibility(c);
 
 	if (!fadeout_client->scene) {
 		free(fadeout_client);
@@ -1227,7 +1234,7 @@ void client_animation_resume(Client *c, double remaining) {
 		c->animation.running = false;
 		if (c->animation.tagouting) {
 			c->animation.tagouting = false;
-			wlr_scene_node_set_enabled(&c->scene->node, false);
+			client_update_visibility(c);
 			c->animation.tagouted = true;
 			c->animation.current = c->geom;
 		}
@@ -1398,7 +1405,8 @@ void resize_apply(Client *c, struct wlr_box geo, ResizeOpts opts) {
 
 		client_draw_border(c, offsets);
 		client_get_clip(c, &clip);
-		client_draw_groupbar(c, offsets);
+		client_draw_group_bar(c, offsets);
+		client_draw_tabbar(c, offsets);
 
 		struct ivec2 surface_clip_offset = clip_to_hide(c, &clip, offsets);
 		client_draw_shield(c, surface_clip_offset);
