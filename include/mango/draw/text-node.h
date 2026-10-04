@@ -41,7 +41,7 @@ struct mango_text_measure {
 
 typedef struct MangoJumpLabel {
 	struct wlr_scene_tree *scene;
-	struct wlr_scene_rect *border;
+	struct wlr_scene_rect *border[4];
 	struct wlr_scene_rect *bg;
 	struct wlr_scene_buffer *scene_buffer;
 	struct mango_text_buffer *buffer;
@@ -78,7 +78,7 @@ typedef struct MangoBarDecoration {
 	uint32_t type;
 	bool is_tab;
 	struct wlr_scene_tree *scene;
-	struct wlr_scene_rect *border;
+	struct wlr_scene_rect *border[4];
 	struct wlr_scene_rect *bg;
 	struct wlr_scene_buffer *scene_buffer;
 	struct mango_text_buffer *buffer;
