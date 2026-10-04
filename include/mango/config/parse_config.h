@@ -163,6 +163,11 @@ typedef struct {
 } ConfigEnv;
 
 typedef struct {
+	char *name;
+	char *value;
+} ConfigVar;
+
+typedef struct {
 	const char *name;			 // Monitor name
 	char *make, *model, *serial; // may be NULL
 	int32_t rr;					 // Rotate and flip (assume integer)
@@ -505,6 +510,9 @@ typedef struct {
 
 	ConfigEnv **env;
 	int32_t env_count;
+
+	ConfigVar **vars;
+	int32_t vars_count;
 
 	char **exec;
 	int32_t exec_count;
