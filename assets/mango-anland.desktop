@@ -1,0 +1,8 @@
+[Desktop Entry]
+Encoding=UTF-8
+Name=Mango Anland
+DesktopNames=mango;wlroots
+Comment=MangoWM Anland 5 session
+Exec=mango-anland start
+Icon=mango
+Type=Application

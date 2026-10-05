@@ -1,4 +1,5 @@
 #include "mango/input/touch.h"
+#include "mango/backend/anland.h"
 #include "mango/common/log.h"
 #include "mango/common/server.h"
 #include "mango/common/util.h"
@@ -41,6 +42,24 @@ struct touch_point {
 // touch emulates the pointer; pointer_touch_id isolates multiple fingers.
 static bool simulating_pointer_from_touch = false;
 static int32_t pointer_touch_id = -1;
+static int32_t cursor_touch_id = -1;
+
+static bool touch_should_drive_cursor(struct wlr_touch *touch) {
+	return mango_anland_touch_is(touch);
+}
+
+static void touch_drive_cursor(struct wlr_touch *touch, int32_t touch_id,
+		double x, double y) {
+	if (!touch_should_drive_cursor(touch))
+		return;
+	if (cursor_touch_id < 0)
+		cursor_touch_id = touch_id;
+	if (cursor_touch_id != touch_id)
+		return;
+	wlr_cursor_warp_absolute(server.cursor, &touch->base, x, y);
+	pointer_cursor_activity();
+}
+
 
 // Reapplied on every touch down.
 void touch_apply_monitor_mapping(struct wlr_touch *touch) {
@@ -178,8 +197,10 @@ void handle_cursor_touch_down(struct wl_listener *listener, void *data) {
 	wl_list_insert(&server.touch_points, &point->link);
 	int touch_point_count = wl_list_length(&server.touch_points);
 
-	// Hides the cursor during touch input.
-	pointer_hide_cursor(NULL);
+	if (!touch_should_drive_cursor(event->touch))
+		pointer_hide_cursor(NULL);
+	else
+		touch_drive_cursor(event->touch, event->touch_id, event->x, event->y);
 
 	if (point->touch_protocol) {
 		// Touch protocol touch point: exit pointer emulation and clear pointer
@@ -197,9 +218,12 @@ void handle_cursor_touch_down(struct wl_listener *listener, void *data) {
 		// xwayland_ignore_scale).
 		touch_apply_xwayland_scale(point->surface, &sx, &sy);
 
-		if (touch_point_count == 1)
+		if (touch_point_count == 1) {
 			wlr_cursor_warp_absolute(server.cursor, &event->touch->base,
-									 event->x, event->y);
+						 event->x, event->y);
+			if (touch_should_drive_cursor(event->touch))
+				pointer_cursor_activity();
+		}
 
 		wl_signal_add(&point->surface->events.destroy, &point->surface_destroy);
 		point->surface_destroy.notify = handle_touch_point_surface_destroy;
@@ -233,6 +257,7 @@ void handle_cursor_touch_motion(struct wl_listener *listener, void *data) {
 	}
 
 	wlr_idle_notifier_v1_notify_activity(server.idle_notifier, server.seat);
+	touch_drive_cursor(event->touch, event->touch_id, event->x, event->y);
 
 	wl_list_for_each(point, &server.touch_points, link) {
 		if (point->touch_id != event->touch_id)
@@ -289,6 +314,8 @@ void handle_cursor_touch_up(struct wl_listener *listener, void *data) {
 			simulating_pointer_from_touch = false;
 			pointer_touch_id = -1;
 		}
+		if (event->touch_id == cursor_touch_id)
+			cursor_touch_id = -1;
 
 		wl_list_remove(&point->link);
 		free(point);
@@ -328,6 +355,8 @@ void handle_cursor_touch_cancel(struct wl_listener *listener, void *data) {
 			simulating_pointer_from_touch = false;
 			pointer_touch_id = -1;
 		}
+		if (event->touch_id == cursor_touch_id)
+			cursor_touch_id = -1;
 
 		wl_list_remove(&point->link);
 		free(point);
@@ -353,6 +382,7 @@ void touch_finish_all(void) {
 		touch_emulate_button(BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED, 0);
 	simulating_pointer_from_touch = false;
 	pointer_touch_id = -1;
+	cursor_touch_id = -1;
 
 	wl_list_for_each_safe(point, tmp, &server.touch_points, link) {
 		if (point->touch_protocol && point->surface)

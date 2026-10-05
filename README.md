@@ -71,6 +71,65 @@ git clone https://github.com/DreamMaoMao/mango-config.git ~/.config/mango
 
 See the [Installation Guide](https://mangowm.github.io/docs/installation) for Fedora, Gentoo, Guix, NixOS, openSUSE, PikaOS, AerynOS, and building from source.
 
+### Anland 5
+
+The native Anland backend requires the matching `anland5` stack installed in dependency order:
+
+| Order | Dependency | Branch | Notes |
+|-------|------------|--------|-------|
+| 1 | [wlroots](https://github.com/luochen88/wlroots/tree/anland5) | `anland5` | wlroots 0.20 with external swapchain support |
+| 2 | [SceneFX](https://github.com/luochen88/scenefx/tree/anland5) | `anland5` | SceneFX 0.5 built against the wlroots branch above |
+| 3 | [Anland](https://github.com/luochen88/anland/tree/anland5) | `anland5` | Installs the `display-producer` pkg-config dependency |
+| 4 | Mango | `anland5` | Build this repository after the three libraries above |
+
+`mangobar` remains an ordinary layer-shell client and does not need an Anland-specific branch.
+
+Enable the backend explicitly when configuring Mango:
+
+```sh
+meson setup build -Danland=enabled -Dxwayland=enabled
+meson compile -C build
+```
+
+`ANLAND_SOCKET` opts into the backend; when unset, Mango uses its normal backend
+selection unchanged. `ANLAND_DRM_DEVICE` selects the render node (falling back to
+`WLR_RENDER_DRM_DEVICE`). A typical Anland session with MangoBar is:
+
+```sh
+export ANLAND_SOCKET=/run/display.sock
+export ANLAND_DRM_DEVICE=/dev/dri/renderD128
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+exec mango -s 'mangobar'
+```
+
+The `mangobar` process is respawned by `mango -s`, so it inherits the session
+environment and shares the compositor's cgroup.
+
+#### Supervised session
+
+Running the compositor under a systemd user unit gives crash supervision and
+control-group cleanup. The session unit (`mango-anland.service`) runs the
+`mango-anland` command, which sets the Anland environment, waits for the daemon
+socket and render node, and then `exec`s the compositor:
+
+```sh
+systemctl --user enable --now mango-anland.service
+mango-anland {start|stop|restart|kill|status}
+```
+
+`Restart=on-failure` plus `RestartSec=2s` brings the compositor back after a crash;
+`kill` additionally clears the failed state so the next `start` is not rate-limited.
+Because `ExecSearchPath=` replaces the unit's `$PATH` with just that list, the unit
+also restates the full `PATH` — otherwise programs the session spawns (`mangobar`,
+`foot`, `swaybg`) would not resolve.
+
+#### Runtime volume control
+
+`anland-volume.sh {get|up|down|toggle|set <0-150>}` maintains `$XDG_RUNTIME_DIR/anland-volume-state`,
+which the producer polls every 100 ms to apply volume to the audio stream. Updates are
+published with write-then-rename and serialized with `flock` so a `get` running
+concurrently with `up`/`down` can neither observe a torn file nor lose an update.
+
 ## Documentation
 
 - **[mangowm.github.io](https://mangowm.github.io/)** — website docs with configuration reference, keybindings, layouts, IPC, and more

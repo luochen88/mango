@@ -11,7 +11,43 @@
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_virtual_keyboard_v1.h>
+#include <stdint.h>
 #include <wlr/types/wlr_xdg_shell.h>
+
+static bool valid_utf8(const char *text) {
+	const unsigned char *s = (const unsigned char *)text;
+	while (*s) {
+		uint32_t cp;
+		size_t n;
+		if (*s < 0x80) { s++; continue; }
+		if ((*s & 0xe0) == 0xc0) { cp = *s & 0x1f; n = 1; if (cp < 2) return false; }
+		else if ((*s & 0xf0) == 0xe0) { cp = *s & 0x0f; n = 2; }
+		else if ((*s & 0xf8) == 0xf0) { cp = *s & 0x07; n = 3; }
+		else return false;
+		for (size_t i = 0; i < n; i++) { if ((s[i + 1] & 0xc0) != 0x80) return false; cp = (cp << 6) | (s[i + 1] & 0x3f); }
+		if ((n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) ||
+				cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+		s += n + 1;
+	}
+	return true;
+}
+
+bool mango_text_input_commit_utf8(struct mango_input_method_relay *relay,
+		const char *text, size_t length) {
+	if (!relay || !relay->active_text_input || !text || length == 0 ||
+			length > 1024 * 1024 || memchr(text, '\0', length)) {
+		return false;
+	}
+	char *copy = strndup(text, length);
+	if (!copy || !valid_utf8(copy)) {
+		free(copy);
+		return false;
+	}
+	wlr_text_input_v3_send_commit_string(relay->active_text_input->input, copy);
+	wlr_text_input_v3_send_done(relay->active_text_input->input);
+	free(copy);
+	return true;
+}
 
 Monitor *output_from_wlr_output(struct wlr_output *wlr_output) {
 	Monitor *m = NULL;

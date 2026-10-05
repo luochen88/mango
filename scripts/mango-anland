@@ -1,0 +1,82 @@
+#!/bin/sh
+set -eu
+
+SERVICE=mango-anland.service
+RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+LOCK_FILE="$RUNTIME_DIR/mango-anland.lock"
+
+export ANLAND=1
+export ANLAND_SOCKET=${ANLAND_SOCKET:-/run/display.sock}
+export ANLAND_DRM_DEVICE=${ANLAND_DRM_DEVICE:-/dev/dri/renderD128}
+export WLR_RENDER_DRM_DEVICE=${WLR_RENDER_DRM_DEVICE:-$ANLAND_DRM_DEVICE}
+export XWAYLAND_GBM_DEVICE=${XWAYLAND_GBM_DEVICE:-$ANLAND_DRM_DEVICE}
+export ANLAND_SKIP_IMPLICIT_SYNC_WAIT=${ANLAND_SKIP_IMPLICIT_SYNC_WAIT:-1}
+export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+export PULSE_SERVER=${PULSE_SERVER:-unix:$RUNTIME_DIR/pulse/native}
+export XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-wayland}
+export XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-mango}
+export MESA_LOADER_DRIVER_OVERRIDE=${MESA_LOADER_DRIVER_OVERRIDE:-kgsl}
+export GALLIUM_DRIVER=${GALLIUM_DRIVER:-zink}
+export WLR_RENDERER_ALLOW_SOFTWARE=${WLR_RENDERER_ALLOW_SOFTWARE:-1}
+
+wait_for_anland() {
+    i=0
+    while [ "$i" -lt 60 ]; do
+        if [ -S "$ANLAND_SOCKET" ] && [ -e "$ANLAND_DRM_DEVICE" ]; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.5
+    done
+    echo "mango-anland: Anland socket or DRM device is unavailable" >&2
+    return 1
+}
+
+run_mango() {
+    wait_for_anland
+    command -v mango >/dev/null 2>&1 || {
+        echo "mango-anland: mango executable is unavailable" >&2
+        return 1
+    }
+    command -v mangobar >/dev/null 2>&1 || {
+        echo "mango-anland: mangobar executable is unavailable" >&2
+        return 1
+    }
+    mkdir -p "$RUNTIME_DIR"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        echo "mango-anland: session is already running" >&2
+        return 1
+    fi
+    exec mango -s 'while :; do mangobar; sleep 1; done'
+}
+
+case "${1:-start}" in
+    start)
+        if [ "${MANGO_ANLAND_SYSTEMD:-0}" = 1 ]; then
+            run_mango
+        else
+            exec systemctl --user start "$SERVICE"
+        fi
+        ;;
+    stop)
+        exec systemctl --user stop "$SERVICE"
+        ;;
+    restart)
+        exec systemctl --user restart "$SERVICE"
+        ;;
+    kill)
+        systemctl --user stop "$SERVICE" || true
+        systemctl --user reset-failed "$SERVICE" || true
+        ;;
+    status)
+        exec systemctl --user status "$SERVICE"
+        ;;
+    run)
+        run_mango
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|kill|status|run}" >&2
+        exit 2
+        ;;
+esac

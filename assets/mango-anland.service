@@ -1,0 +1,35 @@
+[Unit]
+Description=MangoWM Anland session
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service pipewire-pulse.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=MANGO_ANLAND_SYSTEMD=1
+Environment=ANLAND_SOCKET=/run/display.sock
+Environment=ANLAND_DRM_DEVICE=/dev/dri/renderD128
+Environment=WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+Environment=XWAYLAND_GBM_DEVICE=/dev/dri/renderD128
+Environment=ANLAND_SKIP_IMPLICIT_SYNC_WAIT=1
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=mango
+Environment=MESA_LOADER_DRIVER_OVERRIDE=kgsl
+Environment=GALLIUM_DRIVER=zink
+Environment=WLR_RENDERER_ALLOW_SOFTWARE=1
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecSearchPath=%h/.local/bin:/usr/local/bin
+ExecStart=mango-anland run
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+TimeoutStopSec=5s
+TasksMax=infinity
+
+[Install]
+WantedBy=graphical-session.target

@@ -65,6 +65,8 @@ void mango_im_relay_finish(struct mango_input_method_relay *relay);
 
 void mango_im_relay_set_focus(struct mango_input_method_relay *relay,
 							  struct wlr_surface *surface);
+bool mango_text_input_commit_utf8(struct mango_input_method_relay *relay,
+	const char *text, size_t length);
 /*----------------------------------------------------------*/
 
 /* ------------------ Protocol internal code ------------------------------ */

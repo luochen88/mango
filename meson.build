@@ -40,6 +40,7 @@ libscenefx_dep = dependency('scenefx-0.5',version: '>=0.5.0')
 pixman_dep = dependency('pixman-1')
 cjson_dep = dependency('libcjson')
 pangocairo_dep = dependency('pangocairo')
+anland_dep = dependency('display-producer', required : get_option('anland'))
 
 # version info
 git = find_program('git', required : false)
@@ -77,6 +78,9 @@ c_args = [
   '-DVERSION="@0@"'.format(version_with_hash),
   '-DSYSCONFDIR="@0@"'.format('/etc'),
 ]
+if anland_dep.found()
+  c_args += '-DHAVE_ANLAND'
+endif
 
 # add debug args only when debug option is enabled
 if get_option('asan')
@@ -126,6 +130,7 @@ executable('mango',
     pixman_dep,
     cjson_dep,
     pangocairo_dep,
+    anland_dep,
   ],
   install : true,
   c_args : c_args,
@@ -177,6 +182,7 @@ mandir = get_option('mandir')
 desktop_install_dir = join_paths(prefix, 'share/wayland-sessions')
 portal_install_dir = join_paths(prefix, 'share/xdg-desktop-portal')
 install_data('assets/mango.desktop', install_dir : desktop_install_dir)
+install_data('assets/mango-anland.desktop', install_dir : desktop_install_dir)
 install_data('assets/mango-portals.conf', install_dir : portal_install_dir)
 install_data('assets/config.conf', install_dir : join_paths(sysconfdir, 'mango'))
 
@@ -186,6 +192,14 @@ install_data('assets/config.conf', install_dir : join_paths(sysconfdir, 'mango')
 # set_activation_env() in src/main.c
 install_data('assets/mango-session.target',
   install_dir : join_paths(prefix, 'lib/systemd/user'))
+install_data('assets/mango-anland.service',
+  install_dir : join_paths(prefix, 'lib/systemd/user'))
+install_data('scripts/mango-anland',
+  install_dir : join_paths(prefix, 'bin'),
+  install_mode : 'rwxr-xr-x')
+install_data('scripts/anland-volume.sh',
+  install_dir : join_paths(prefix, 'bin'),
+  install_mode : 'rwxr-xr-x')
 
 # generate the mmsg man page at build time so the version always
 # matches the project version

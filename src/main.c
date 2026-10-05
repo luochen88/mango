@@ -1,6 +1,7 @@
 /*
  * See LICENSE file for copyright and license details.
  */
+#include "mango/backend/anland.h"
 #include "mango/animation/common.h"
 #include "mango/common/log.h"
 #include "mango/common/server.h"
@@ -479,17 +480,26 @@ void setup(void) {
 	 * doesn't meet your needs. The backend uses the renderer, for example,
 	 * to fall back to software cursors if the backend does not support
 	 * hardware cursors (some older GPUs don't). */
-	if (!(server.backend =
-			  wlr_backend_autocreate(server.event_loop, &server.session)))
-		die("couldn't create backend");
-
-	server.headless_backend = wlr_headless_backend_create(server.event_loop);
-	if (!server.headless_backend) {
-		mango_error(true, WLR_ERROR,
-					"Failed to create secondary headless backend");
-	} else {
-		wlr_multi_backend_add(server.backend, server.headless_backend);
+#ifdef HAVE_ANLAND
+	const char *anland_socket = getenv("ANLAND_SOCKET");
+	if (anland_socket && *anland_socket) {
+		server.backend = mango_anland_backend_create(server.event_loop,
+			anland_socket);
+		server.session = NULL;
+		server.headless_backend = NULL;
+	} else
+#endif
+	{
+		server.backend = wlr_backend_autocreate(server.event_loop,
+			&server.session);
+		if (server.backend) {
+			server.headless_backend = wlr_headless_backend_create(server.event_loop);
+			if (server.headless_backend)
+				wlr_multi_backend_add(server.backend, server.headless_backend);
+		}
 	}
+	if (!server.backend)
+		die("couldn't create backend");
 
 	/* Initialize the scene graph used to lay out windows */
 	server.scene = wlr_scene_create();

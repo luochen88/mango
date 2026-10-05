@@ -1,4 +1,5 @@
 #include "mango/manage/monitor.h"
+#include "mango/backend/anland.h"
 #include "mango/animation/client.h"
 #include "mango/animation/common.h"
 #include "mango/animation/layer.h"
@@ -372,6 +373,15 @@ bool mango_scene_output_commit(struct wlr_scene_output *scene_output,
 	struct wlr_scene_output_state_options opts = {0};
 	if (m->icc_transform && !has_img_desc)
 		opts.color_transform = m->icc_transform;
+	if (mango_anland_output_is(wlr_output)) {
+		/* Anland/Android consumer buffers are imported as external dmabufs and
+		 * must not rely on preserved contents across acquisitions. Cursor-only
+		 * damage otherwise redraws just the cursor trail, leaving untouched areas
+		 * black on freshly acquired buffers. */
+		wlr_damage_ring_add_whole(&scene_output->damage_ring);
+	}
+	if (mango_anland_output_is(wlr_output))
+		opts.swapchain = mango_anland_output_swapchain(wlr_output);
 	if (!wlr_scene_output_build_state(scene_output, state, &opts))
 		return false;
 
@@ -748,7 +758,7 @@ void handle_new_output(struct wl_listener *listener, void *data) {
 		(state.committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION) ||
 		wlr_output->image_description != NULL;
 	struct wlr_scene_output_state_options opts = {
-		.swapchain = NULL, // Lets the scene create it automatically.
+		.swapchain = mango_anland_output_swapchain(wlr_output),
 		.color_transform = NULL,
 	};
 	if (m->icc_transform && !has_img_desc)
