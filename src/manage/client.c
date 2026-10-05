@@ -1,5 +1,6 @@
 #include "mango/manage/client.h"
 #include "mango/animation/client.h"
+#include "mango/common/input-event-codes.h"
 #include "mango/common/log.h"
 #include "mango/common/server.h"
 #include "mango/common/util.h"
@@ -20,7 +21,6 @@
 #include "mango/overview/overview.h"
 #include "mango/switcher/switcher.h"
 #include <fcntl.h>
-#include <linux/input-event-codes.h>
 #include <unistd.h>
 #include <wlr/types/wlr_alpha_modifier_v1.h>
 #include <wlr/types/wlr_color_management_v1.h>
