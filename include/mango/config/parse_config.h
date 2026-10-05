@@ -116,8 +116,8 @@ typedef struct {
 	float scroller_proportion;
 	int32_t animation_type_open;
 	int32_t animation_type_close;
-	int32_t isnoborder;
-	int32_t isnoanimation;
+	int32_t no_border;
+	int32_t no_animation;
 	int32_t isopensilent;
 	int32_t istagsilent;
 	int32_t isnamedscratchpad;
@@ -128,7 +128,7 @@ typedef struct {
 	int32_t allow_shortcuts_inhibit;
 	int32_t ignore_maximize;
 	int32_t ignore_minimize;
-	int32_t isnosizehint;
+	int32_t no_size_hint;
 	int32_t idleinhibit_when_focus;
 	int32_t vrr_only_fullscreen;
 	int32_t force_render;
@@ -138,16 +138,16 @@ typedef struct {
 	int32_t offsety;
 	float width;
 	float height;
-	int32_t nofocus;
-	int32_t nofadein;
-	int32_t nofadeout;
+	int32_t no_focus;
+	int32_t no_fade_in;
+	int32_t no_fade_out;
 	int32_t no_force_center;
 	int32_t isterm;
 	int32_t allow_csd;
 	int32_t force_fakemaximize;
 	int32_t force_tiled_state;
 	int32_t force_tearing;
-	int32_t noswallow;
+	int32_t no_swallow;
 	int32_t confine_pointer;
 	float focused_opacity;
 	float unfocused_opacity;
@@ -210,7 +210,7 @@ typedef struct {
 	int32_t animation_type_open;
 	int32_t animation_type_close;
 	int32_t shield_when_capture;
-	int32_t noanim;
+	int32_t no_animation;
 } ConfigLayerRule;
 
 typedef struct {

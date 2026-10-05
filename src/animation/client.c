@@ -34,7 +34,7 @@ static int32_t client_close_animation_type(const Client *c) {
 }
 
 bool client_animations_enabled(const Client *c) {
-	if (c && c->isnoanimation)
+	if (c && c->no_animation)
 		return false;
 	if (config.animations)
 		return true;
@@ -1007,7 +1007,7 @@ void fadeout_client_animation_next_tick(Client *c) {
 					 (opacity_eased_progress * config.fadeout_begin_opacity);
 	double opacity = MANGO_MAX(percent, 0);
 
-	if (config.animation_fade_out && !c->nofadeout)
+	if (config.animation_fade_out && !c->no_fade_out)
 		wlr_scene_node_for_each_buffer(&c->scene->node,
 									   scene_buffer_apply_opacity, &opacity);
 
@@ -1148,7 +1148,7 @@ void init_fadeout_client(Client *c) {
 	fadeout_client->animation_type_close = c->animation_type_close;
 	fadeout_client->animation.action = CLOSE;
 	fadeout_client->bw = c->bw;
-	fadeout_client->nofadeout = c->nofadeout;
+	fadeout_client->no_fade_out = c->no_fade_out;
 
 	fadeout_client->animation.initial.x = 0;
 	fadeout_client->animation.initial.y = 0;
@@ -1308,7 +1308,7 @@ void client_set_pending_state(Client *c) {
 		c->animation.duration = 0;
 	}
 
-	if (c->isnoanimation) {
+	if (c->no_animation) {
 		c->animation.should_animate = false;
 		c->animation.duration = 0;
 	}
@@ -1341,7 +1341,7 @@ void resize_apply(Client *c, struct wlr_box geo, ResizeOpts opts) {
 		client_apply_bounds(c, bbox);
 	}
 
-	if (!c->isnosizehint && !c->ismaximizescreen && !c->isfullscreen &&
+	if (!c->no_size_hint && !c->ismaximizescreen && !c->isfullscreen &&
 		c->isfloating)
 		client_set_size_bound(c);
 
@@ -1378,7 +1378,7 @@ void resize_apply(Client *c, struct wlr_box geo, ResizeOpts opts) {
 	else
 		c->animainit_geom = c->animation.current;
 
-	if (c->isnoborder || c->iskilling)
+	if (c->no_border || c->iskilling)
 		c->bw = 0;
 	else if (!c->isfullscreen)
 		c->bw = config.borderpx;
@@ -1561,7 +1561,7 @@ bool client_apply_focus_opacity(Client *c) {
 
 		double opacity_eased_progress =
 			find_animation_curve_at(linear_progress, OPAFADEIN);
-		float percent = config.animation_fade_in && !c->nofadein
+		float percent = config.animation_fade_in && !c->no_fade_in
 							? opacity_eased_progress
 							: 1.0;
 		float opacity =
