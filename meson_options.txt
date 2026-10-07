@@ -1,3 +1,4 @@
 option('xwayland', type : 'feature', value : 'enabled')
 option('asan', type : 'boolean', value : false)
 option('anland', type : 'feature', value : 'auto')
+option('version_suffix', type : 'string', value : '', description : 'Override VERSION suffix instead of reading Git HEAD')

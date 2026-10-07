@@ -43,27 +43,27 @@ pangocairo_dep = dependency('pangocairo')
 anland_dep = dependency('display-producer', required : get_option('anland'))
 
 # version info
-git = find_program('git', required : false)
-is_git_repo = false
-
-# check if current directory is a git repo
-if git.found()
-  git_status = run_command(git, 'rev-parse', '--is-inside-work-tree', check : false)
-  if git_status.returncode() == 0 and git_status.stdout().strip() == 'true'
-    is_git_repo = true
-  endif
-endif
-
-if is_git_repo
-  # if current directory is a git repo, get commit hash and latest tag
-  commit_hash = run_command(git, 'rev-parse', '--short', 'HEAD', check : false).stdout().strip()
-  latest_tag = meson.project_version()
-  version_with_hash = '@0@(@1@)'.format(latest_tag, commit_hash)
+version_suffix = get_option('version_suffix')
+if version_suffix != ''
+  version_with_hash = '@0@(@1@)'.format(meson.project_version(), version_suffix)
 else
-  # if not a git repo, use project version and "release" string
-  commit_hash = 'release'
-  latest_tag = meson.project_version()
-  version_with_hash = '@0@(@1@)'.format(latest_tag, commit_hash)
+  git = find_program('git', required : false)
+  is_git_repo = false
+
+  # check if current directory is a git repo
+  if git.found()
+    git_status = run_command(git, 'rev-parse', '--is-inside-work-tree', check : false)
+    if git_status.returncode() == 0 and git_status.stdout().strip() == 'true'
+      is_git_repo = true
+    endif
+  endif
+
+  if is_git_repo
+    commit_hash = run_command(git, 'rev-parse', '--short', 'HEAD', check : false).stdout().strip()
+    version_with_hash = '@0@(@1@)'.format(meson.project_version(), commit_hash)
+  else
+    version_with_hash = '@0@(release)'.format(meson.project_version())
+  endif
 endif
 
 # define compilation args

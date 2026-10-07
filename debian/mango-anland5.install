@@ -1,0 +1,11 @@
+usr/bin/mango
+usr/bin/mmsg
+usr/bin/mango-anland
+usr/bin/anland-volume.sh
+usr/share/man/man1/mmsg.1
+usr/share/wayland-sessions/mango.desktop
+usr/share/wayland-sessions/mango-anland.desktop
+usr/share/xdg-desktop-portal/mango-portals.conf
+usr/lib/systemd/user/mango-session.target
+usr/lib/systemd/user/mango-anland.service
+etc/mango/config.conf
