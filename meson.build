@@ -137,6 +137,8 @@ executable('mango',
   link_args : link_args,
 )
 
+subdir('tests')
+
 # build mmsg
 
 wayland_scanner_client_header = generator(

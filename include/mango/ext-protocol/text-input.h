@@ -9,6 +9,7 @@ struct mango_input_method_relay {
 	struct wl_list text_inputs;
 	struct wlr_input_method_v2 *input_method;
 	struct wlr_surface *focused_surface;
+	bool direct_mode;
 
 	struct wlr_keyboard_modifiers forwarded_modifiers;
 
@@ -27,6 +28,7 @@ struct mango_input_method_relay {
 
 	struct wl_listener keyboard_grab_destroy;
 	struct wl_listener focused_surface_destroy;
+	struct wl_listener seat_focus_change;
 };
 
 struct mango_input_method_popup {

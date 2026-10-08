@@ -363,6 +363,12 @@ bool mango_scene_output_commit(struct wlr_scene_output *scene_output,
 		 WLR_OUTPUT_STATE_TRANSFORM | WLR_OUTPUT_STATE_ENABLED |
 		 WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED |
 		 WLR_OUTPUT_STATE_IMAGE_DESCRIPTION);
+	if (mango_anland_output_is(wlr_output)) {
+		/* A newly writable Android consumer slot has no preserved scene content.
+		 * Add full damage before the needs_frame check so a static scene renders
+		 * once when that target is published. */
+		wlr_damage_ring_add_whole(&scene_output->damage_ring);
+	}
 	if (!state_changed && !wlr_scene_output_needs_frame(scene_output))
 		return true;
 
@@ -373,13 +379,6 @@ bool mango_scene_output_commit(struct wlr_scene_output *scene_output,
 	struct wlr_scene_output_state_options opts = {0};
 	if (m->icc_transform && !has_img_desc)
 		opts.color_transform = m->icc_transform;
-	if (mango_anland_output_is(wlr_output)) {
-		/* Anland/Android consumer buffers are imported as external dmabufs and
-		 * must not rely on preserved contents across acquisitions. Cursor-only
-		 * damage otherwise redraws just the cursor trail, leaving untouched areas
-		 * black on freshly acquired buffers. */
-		wlr_damage_ring_add_whole(&scene_output->damage_ring);
-	}
 	if (mango_anland_output_is(wlr_output))
 		opts.swapchain = mango_anland_output_swapchain(wlr_output);
 	if (!wlr_scene_output_build_state(scene_output, state, &opts))

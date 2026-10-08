@@ -1,3 +1,13 @@
+mango (0.17.5-2anland5) trixie; urgency=medium
+
+  * Track active commits and retained output slots independently.
+  * Drain Anland outcomes before teardown and reset pressed input state.
+  * Preserve partial input payloads and harden clipboard teardown re-entry.
+  * Make direct text-input-v3 focus strict and replay complete state once on IME restart.
+  * Add deterministic CPU regressions for backend and text-input lifecycle behavior.
+
+ -- Anland Maintainers <noreply@example.invalid>  Thu, 08 Oct 2026 00:47:16 +0000
+
 mango (0.17.5-1anland5) trixie; urgency=medium
 
   * Package Mango Anland 5 compositor session.

@@ -30,6 +30,7 @@
 #include <wlr/render/swapchain.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/util/log.h>
 
 #define RECONNECT_MS 200
@@ -38,6 +39,8 @@
 #define CLIPBOARD_MIME_UTF8 "text/plain;charset=utf-8"
 #define CLIPBOARD_MIME_TEXT "text/plain"
 #define CLIPBOARD_TRANSFER_TIMEOUT_MS 1000
+#define INPUT_MESSAGE_TIMEOUT_MS 1000
+#define INPUT_LEDGER_MAX 64
 #define MANGO_WINDOW_ID 1
 
 struct anland_clipboard_read;
@@ -45,6 +48,7 @@ struct anland_clipboard_write;
 struct anland_buffer {
 	struct wlr_buffer base;
 	struct wlr_dmabuf_attributes attrs;
+	bool submitted;
 };
 struct anland_backend;
 struct anland_output {
@@ -53,10 +57,14 @@ struct anland_output {
 	struct wlr_swapchain *swapchain;
 	struct anland_buffer *buffers[ANLAND_DEVICE_MAX_BUFS];
 	size_t buffer_count;
-	struct wlr_buffer *committed;
-	uint64_t committed_buffer_id;
-	uint64_t committed_commit_id;
-	uint32_t committed_commit_seq;
+	uint64_t active_commit;
+	uint32_t active_commit_seq;
+};
+
+enum pending_input_kind {
+	PENDING_INPUT_NONE,
+	PENDING_INPUT_PAYLOAD,
+	PENDING_INPUT_FDS,
 };
 
 struct anland_backend {
@@ -73,6 +81,7 @@ struct anland_backend {
 	struct wlr_pointer pointer;
 	struct wlr_touch touch;
 	struct wl_event_source *data_source, *ready_source, *scene_source, *reconnect_source;
+	struct wl_event_source *frame_source, *pump_source, *input_source;
 	uint32_t width, height, format, refresh;
 	bool announced;
 	bool output_initialized;
@@ -84,21 +93,39 @@ struct anland_backend {
 	anland_de_target_t target;
 	bool have_target;
 	uint64_t session_generation;
+	bool session_lost;
+	bool destroying;
+	enum pending_input_kind pending_input;
+	anland_device_input_t pending_event;
+	char *input_payload;
+	size_t input_payload_size;
+	uint64_t input_deadline_msec;
+	uint32_t pressed_buttons[INPUT_LEDGER_MAX];
+	size_t pressed_button_count;
+	uint32_t touch_ids[INPUT_LEDGER_MAX];
+	size_t touch_count;
 };
 
 static void cancel_clipboard_read(struct anland_backend *backend);
 static void clear_clipboard_writes(struct anland_backend *backend);
 static void drop_session(struct anland_backend *backend);
 static bool dispatch_scene_events(struct anland_backend *backend);
+static void emit_pointer_frame(struct anland_backend *backend);
+static int handle_ready(int fd, uint32_t mask, void *data);
+static int handle_input(int fd, uint32_t mask, void *data);
 
 static const struct wlr_keyboard_impl keyboard_impl = {.name = "anland-keyboard"};
 static const struct wlr_pointer_impl pointer_impl = {.name = "anland-pointer"};
 static const struct wlr_touch_impl touch_impl = {.name = "anland-touch"};
 
-static uint32_t now_msec(void) {
+static uint64_t monotonic_msec(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint32_t)(ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL);
+	return ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static uint32_t now_msec(void) {
+	return (uint32_t)monotonic_msec();
 }
 
 static double normalized(float value, uint32_t extent) {
@@ -127,11 +154,15 @@ static const struct wlr_buffer_impl buffer_impl = {
 
 static size_t select_slot(void *data) {
 	struct anland_backend *backend = data;
-	if (!backend->have_target || backend->target.index >= backend->target.count ||
-			backend->target.index >= backend->output.buffer_count) {
+	anland_de_target_t target;
+	if (anland_de_backend_get_writable_target(backend->producer, &target) != 0 ||
+			target.generation != backend->session_generation ||
+			target.count != backend->output.buffer_count ||
+			target.index >= target.count) {
 		return SIZE_MAX;
 	}
-	return backend->target.index;
+	struct anland_buffer *buffer = backend->output.buffers[target.index];
+	return !buffer || buffer->submitted ? SIZE_MAX : target.index;
 }
 
 static uint32_t protocol_format_to_drm(uint32_t format) {
@@ -157,13 +188,15 @@ static void clear_target(struct anland_backend *backend) {
 
 static void drop_buffers(struct anland_backend *backend) {
 	struct anland_output *output = &backend->output;
-	if (output->committed) {
-		wlr_buffer_unlock(output->committed);
-		output->committed = NULL;
+	for (size_t i = 0; i < output->buffer_count; i++) {
+		struct anland_buffer *buffer = output->buffers[i];
+		if (buffer && buffer->submitted) {
+			buffer->submitted = false;
+			wlr_buffer_unlock(&buffer->base);
+		}
 	}
-	output->committed_buffer_id = 0;
-	output->committed_commit_id = 0;
-	output->committed_commit_seq = 0;
+	output->active_commit = 0;
+	output->active_commit_seq = 0;
 	wlr_swapchain_destroy(output->swapchain);
 	output->swapchain = NULL;
 	output->buffer_count = 0;
@@ -192,11 +225,11 @@ static void disarm_reconnect(struct anland_backend *backend) {
 
 static void producer_pre_release(void *data) {
 	struct anland_backend *backend = data;
+	backend->session_lost = true;
 	remove_consumer_sources(backend);
 	cancel_clipboard_read(backend);
 	clear_clipboard_writes(backend);
 	anland_audio_set_fd(-1);
-	drop_buffers(backend);
 	arm_reconnect(backend);
 }
 
@@ -357,44 +390,59 @@ static bool refresh_target(struct anland_backend *backend,
 	return true;
 }
 
-static void send_present_event(struct anland_backend *backend) {
+static void send_present_event(struct anland_backend *backend, bool presented) {
 	struct wlr_output_event_present event = {
-		.commit_seq = backend->output.committed_commit_seq,
-		.presented = true,
+		.commit_seq = backend->output.active_commit_seq,
+		.presented = presented,
 	};
 	wlr_output_send_present(&backend->output.base, &event);
+}
+
+static bool import_release_fence(struct anland_buffer *buffer, int fence_fd) {
+	if (fence_fd < 0)
+		return true;
+	struct dma_buf_import_sync_file sync = {
+		.flags = DMA_BUF_SYNC_WRITE,
+		.fd = fence_fd,
+	};
+	return ioctl(buffer->attrs.fd[0], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &sync) == 0;
 }
 
 static bool handle_scene_event(struct anland_backend *backend,
 		const anland_scene_event_t *event) {
 	switch (event->type) {
 	case ANLAND_SCENE_EVENT_PRESENTED:
-		if (backend->output.committed_commit_id == 0 ||
-				backend->output.committed_commit_id != event->commit_id) {
+		if (backend->output.active_commit == 0 ||
+				backend->output.active_commit != event->commit_id) {
 			return false;
 		}
-		backend->output.committed_commit_id = 0;
-		send_present_event(backend);
+		backend->output.active_commit = 0;
+		send_present_event(backend, true);
 		return true;
-	case ANLAND_SCENE_EVENT_BUFFER_RELEASED:
-		if (event->u.released.release_fence_fd >= 0) {
-			close(event->u.released.release_fence_fd);
-		}
-		if (backend->output.committed &&
-				backend->output.committed_buffer_id == event->u.released.buffer_id) {
-			wlr_buffer_unlock(backend->output.committed);
-			backend->output.committed = NULL;
-			backend->output.committed_buffer_id = 0;
-			backend->output.committed_commit_seq = 0;
-			return true;
-		}
-		return backend->output.committed_buffer_id == 0;
+	case ANLAND_SCENE_EVENT_BUFFER_RELEASED: {
+		int fence_fd = event->u.released.release_fence_fd;
+		uint64_t buffer_id = event->u.released.buffer_id;
+		struct anland_buffer *buffer = NULL;
+		if (buffer_id > 0 && buffer_id <= backend->output.buffer_count)
+			buffer = backend->output.buffers[buffer_id - 1];
+		bool ok = buffer && buffer->submitted;
+		if (ok && fence_fd >= 0)
+			ok = import_release_fence(buffer, fence_fd);
+		if (fence_fd >= 0)
+			close(fence_fd);
+		if (!ok)
+			return false;
+		buffer->submitted = false;
+		wlr_buffer_unlock(&buffer->base);
+		return true;
+	}
 	case ANLAND_SCENE_EVENT_COMMIT_DROPPED:
-		if (backend->output.committed_commit_id == event->commit_id) {
-			backend->output.committed_commit_id = 0;
+		if (backend->output.active_commit == event->commit_id) {
+			backend->output.active_commit = 0;
+			send_present_event(backend, false);
 			return true;
 		}
-		return backend->output.committed_commit_id == 0 || event->commit_id == 0;
+		return backend->output.active_commit == 0 || event->commit_id == 0;
 	case ANLAND_SCENE_EVENT_OUTPUT_CHANGED:
 		if (event->u.output.width == 0 || event->u.output.height == 0 ||
 				!apply_output_change(backend)) {
@@ -413,14 +461,62 @@ static bool handle_scene_event(struct anland_backend *backend,
 		if (!backend->announced && apply_output_change(backend)) {
 			announce_devices(backend);
 		}
-		wlr_output_update_needs_frame(&backend->output.base);
-		wlr_output_send_frame(&backend->output.base);
 		return true;
 	}
 	return true;
 }
 
+static void arm_frame(struct anland_backend *backend) {
+	if (!backend->destroying && !backend->session_lost && backend->frame_source)
+		wl_event_source_timer_update(backend->frame_source, 1);
+}
+
+static void arm_pump(struct anland_backend *backend) {
+	if (!backend->destroying && !backend->session_lost && backend->pump_source)
+		wl_event_source_timer_update(backend->pump_source, 1);
+}
+
+static int frame_tick(void *data) {
+	struct anland_backend *backend = data;
+	anland_de_target_t target;
+	if (backend->destroying || backend->session_lost ||
+			!backend->output.swapchain || backend->output.active_commit ||
+			anland_de_backend_get_writable_target(backend->producer, &target) != 0 ||
+			target.generation != backend->session_generation ||
+			target.count != backend->output.buffer_count ||
+			target.index >= target.count || !backend->output.buffers[target.index] ||
+			backend->output.buffers[target.index]->submitted) {
+		return 0;
+	}
+	wlr_output_update_needs_frame(&backend->output.base);
+	wlr_output_send_frame(&backend->output.base);
+	return 0;
+}
+
+static int pump_tick(void *data) {
+	return handle_ready(-1, WL_EVENT_READABLE, data);
+}
+
+static bool handle_scene_event_batch(struct anland_backend *backend,
+		anland_scene_event_t *events, size_t count, bool *target_ready) {
+	for (size_t i = 0; i < count; i++) {
+		if (events[i].type == ANLAND_SCENE_EVENT_RENDER_TARGET_READY)
+			*target_ready = true;
+		if (handle_scene_event(backend, &events[i]))
+			continue;
+		for (size_t j = i + 1; j < count; j++) {
+			if (events[j].type == ANLAND_SCENE_EVENT_BUFFER_RELEASED &&
+					events[j].u.released.release_fence_fd >= 0) {
+				close(events[j].u.released.release_fence_fd);
+			}
+		}
+		return false;
+	}
+	return true;
+}
+
 static bool dispatch_scene_events(struct anland_backend *backend) {
+	bool target_ready = false;
 	for (;;) {
 		anland_scene_event_t events[ANLAND_SCENE_EVENT_QUEUE];
 		size_t count = 0;
@@ -429,23 +525,88 @@ static bool dispatch_scene_events(struct anland_backend *backend) {
 			return false;
 		}
 		if (count == 0) {
-			return true;
+			break;
 		}
-		for (size_t i = 0; i < count; i++) {
-			if (!handle_scene_event(backend, &events[i])) {
-				return false;
-			}
-		}
+		if (!handle_scene_event_batch(backend, events, count, &target_ready))
+			return false;
 		if (count < ANLAND_SCENE_EVENT_QUEUE) {
-			return true;
+			break;
 		}
 	}
+	if (target_ready)
+		arm_frame(backend);
+	return true;
+}
+
+static bool track_input_id(uint32_t *ids, size_t *count, uint32_t id, bool down) {
+	for (size_t i = 0; i < *count; i++) {
+		if (ids[i] != id)
+			continue;
+		if (!down)
+			ids[i] = ids[--*count];
+		return true;
+	}
+	if (!down)
+		return true;
+	if (*count == INPUT_LEDGER_MAX)
+		return false;
+	ids[(*count)++] = id;
+	return true;
+}
+
+static void reset_input(struct anland_backend *backend) {
+	uint32_t time = now_msec();
+	while (backend->keyboard.num_keycodes) {
+		struct wlr_keyboard_key_event event = {
+			.time_msec = time,
+			.keycode = backend->keyboard.keycodes[backend->keyboard.num_keycodes - 1],
+			.update_state = true,
+			.state = WL_KEYBOARD_KEY_STATE_RELEASED,
+		};
+		wlr_keyboard_notify_key(&backend->keyboard, &event);
+	}
+	bool had_buttons = backend->pressed_button_count != 0;
+	while (backend->pressed_button_count) {
+		struct wlr_pointer_button_event event = {
+			.pointer = &backend->pointer,
+			.time_msec = time,
+			.button = backend->pressed_buttons[--backend->pressed_button_count],
+			.state = WL_POINTER_BUTTON_STATE_RELEASED,
+		};
+		wlr_pointer_notify_button(&backend->pointer, &event);
+	}
+	if (had_buttons)
+		emit_pointer_frame(backend);
+	bool had_touches = backend->touch_count != 0;
+	while (backend->touch_count) {
+		struct wlr_touch_cancel_event event = {
+			.touch = &backend->touch,
+			.time_msec = time,
+			.touch_id = backend->touch_ids[--backend->touch_count],
+		};
+		wl_signal_emit_mutable(&backend->touch.events.cancel, &event);
+	}
+	if (had_touches)
+		wl_signal_emit_mutable(&backend->touch.events.frame, &backend->touch);
+}
+
+static void clear_pending_input(struct anland_backend *backend) {
+	free(backend->input_payload);
+	backend->input_payload = NULL;
+	backend->input_payload_size = 0;
+	backend->pending_input = PENDING_INPUT_NONE;
+	backend->input_deadline_msec = 0;
+	if (backend->input_source)
+		wl_event_source_timer_update(backend->input_source, -1);
 }
 
 static void drop_session(struct anland_backend *backend) {
 	producer_pre_release(backend);
 	anland_de_backend_drop_session(backend->producer);
 	(void)dispatch_scene_events(backend);
+	reset_input(backend);
+	clear_pending_input(backend);
+	drop_buffers(backend);
 	arm_reconnect(backend);
 }
 
@@ -456,9 +617,12 @@ static int handle_ready(int fd, uint32_t mask, void *data) {
 		drop_session(backend);
 		return 0;
 	}
-	if (anland_de_backend_pump(backend->producer, 0) != 0 ||
-			!dispatch_scene_events(backend)) {
+	int pump_rc = anland_de_backend_pump(backend->producer, 0);
+	bool dispatch_ok = dispatch_scene_events(backend);
+	if (!dispatch_ok || !anland_device_is_connected(backend->device)) {
 		drop_session(backend);
+	} else if (pump_rc != 0) {
+		arm_pump(backend);
 	}
 	return 0;
 }
@@ -627,15 +791,18 @@ static void clipboard_read_destroy(struct anland_clipboard_read *transfer) {
 	if (transfer->source) wl_event_source_remove(transfer->source);
 	if (transfer->timer) wl_event_source_remove(transfer->timer);
 	if (transfer->fd >= 0) close(transfer->fd);
-	transfer->backend->clipboard_read = NULL;
+	if (transfer->backend->clipboard_read == transfer)
+		transfer->backend->clipboard_read = NULL;
 	free(transfer->data);
 	free(transfer);
 }
 
 static void finish_clipboard_read(struct anland_clipboard_read *transfer) {
-	if (transfer->size > 0 &&
-			anland_device_is_connected(transfer->backend->device)) {
-		(void)anland_device_set_clipboard(transfer->backend->device,
+	struct anland_backend *backend = transfer->backend;
+	if (backend->clipboard_read == transfer)
+		backend->clipboard_read = NULL;
+	if (transfer->size > 0 && anland_device_is_connected(backend->device)) {
+		(void)anland_device_set_clipboard(backend->device,
 			transfer->data, transfer->size);
 	}
 	clipboard_read_destroy(transfer);
@@ -717,55 +884,96 @@ static void handle_seat_set_selection(struct wl_listener *listener, void *data) 
 		server.seat ? server.seat->selection_source : NULL);
 }
 
-static bool read_text_payload(struct anland_backend *backend, uint32_t type,
-		size_t size) {
-	if (size == 0 || size > ANLAND_DEVICE_MAX_PAYLOAD_SIZE) {
+static bool begin_text_payload(struct anland_backend *backend,
+		const anland_device_input_t *event, size_t size) {
+	if (size == 0)
+		return true;
+	if (size > ANLAND_DEVICE_MAX_PAYLOAD_SIZE)
 		return false;
-	}
-	char *payload = malloc(size + 1);
-	if (!payload) {
+	backend->input_payload = malloc(size + 1);
+	if (!backend->input_payload)
 		return false;
-	}
-	int rc = anland_device_read_input(backend->device, payload, size,
-		CLIPBOARD_TRANSFER_TIMEOUT_MS);
-	if (rc != 1) {
-		free(payload);
-		return false;
-	}
-	payload[size] = '\0';
-	if (type == ANLAND_DEVICE_IN_TEXT_INPUT) {
-		mango_text_input_commit_utf8(server.input_method_relay, payload, size);
-	} else {
-		set_clipboard_from_consumer(backend, payload, size);
-	}
-	free(payload);
+	backend->pending_event = *event;
+	backend->input_payload_size = size;
+	backend->pending_input = PENDING_INPUT_PAYLOAD;
+	backend->input_deadline_msec = monotonic_msec() + INPUT_MESSAGE_TIMEOUT_MS;
+	wl_event_source_timer_update(backend->input_source, 1);
 	return true;
 }
 
-static bool consume_resource_fds(struct anland_backend *backend, uint32_t fdnum) {
-	if (fdnum == 0) {
+static bool begin_resource_fds(struct anland_backend *backend,
+		const anland_device_input_t *event) {
+	if (event->resource.fdnum == 0)
 		return true;
-	}
-	if (fdnum > RESOURCE_FD_MAX) {
+	if (event->resource.fdnum > RESOURCE_FD_MAX)
 		return false;
-	}
-	int fds[RESOURCE_FD_MAX];
-	int count = 0;
-	for (size_t i = 0; i < RESOURCE_FD_MAX; i++) fds[i] = -1;
-	int rc = anland_device_read_fds(backend->device, fds, RESOURCE_FD_MAX,
-		&count, CLIPBOARD_TRANSFER_TIMEOUT_MS);
-	for (int i = 0; i < count; i++) {
-		if (fds[i] >= 0) close(fds[i]);
-	}
-	return rc == 1 && count == (int)fdnum;
+	backend->pending_event = *event;
+	backend->pending_input = PENDING_INPUT_FDS;
+	backend->input_deadline_msec = monotonic_msec() + INPUT_MESSAGE_TIMEOUT_MS;
+	wl_event_source_timer_update(backend->input_source, 1);
+	return true;
 }
 
+static int progress_pending_input(struct anland_backend *backend) {
+	if (backend->pending_input == PENDING_INPUT_NONE)
+		return 1;
+	if (monotonic_msec() >= backend->input_deadline_msec)
+		return -1;
+	int rc;
+	if (backend->pending_input == PENDING_INPUT_PAYLOAD) {
+		rc = anland_device_read_input(backend->device, backend->input_payload,
+			backend->input_payload_size, 0);
+		if (rc == 1) {
+			backend->input_payload[backend->input_payload_size] = '\0';
+			if (backend->pending_event.type == ANLAND_DEVICE_IN_TEXT_INPUT) {
+				mango_text_input_commit_utf8(server.input_method_relay,
+					backend->input_payload, backend->input_payload_size);
+			} else {
+				set_clipboard_from_consumer(backend, backend->input_payload,
+					backend->input_payload_size);
+			}
+			clear_pending_input(backend);
+		}
+	} else {
+		int fds[RESOURCE_FD_MAX];
+		int count = 0;
+		for (size_t i = 0; i < RESOURCE_FD_MAX; i++)
+			fds[i] = -1;
+		rc = anland_device_read_fds(backend->device, fds, RESOURCE_FD_MAX,
+			&count, 0);
+		for (int i = 0; i < count; i++) {
+			if (fds[i] >= 0)
+				close(fds[i]);
+		}
+		if (rc == 1) {
+			if (count != (int)backend->pending_event.resource.fdnum)
+				return -1;
+			clear_pending_input(backend);
+		}
+	}
+	if (rc == 0)
+		wl_event_source_timer_update(backend->input_source, 1);
+	return rc;
+}
+
+static int input_tick(void *data) {
+	return handle_input(-1, 0, data);
+}
 static int handle_input(int fd, uint32_t mask, void *data) {
 	(void)fd;
 	struct anland_backend *backend = data;
 	if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) {
 		drop_session(backend);
 		return 0;
+	}
+	if (backend->pending_input != PENDING_INPUT_NONE) {
+		int pending_rc = progress_pending_input(backend);
+		if (pending_rc < 0) {
+			drop_session(backend);
+			return 0;
+		}
+		if (pending_rc == 0)
+			return 0;
 	}
 	anland_device_input_t ev;
 	int ret;
@@ -783,32 +991,42 @@ static int handle_input(int fd, uint32_t mask, void *data) {
 			wlr_keyboard_notify_key(&backend->keyboard, &e);
 			break;
 		}
-		case ANLAND_DEVICE_IN_PTR_MOTION: {
-			struct wlr_pointer_motion_absolute_event a = {
-				.pointer = &backend->pointer,
-				.time_msec = time,
-				.x = normalized(ev.pointer_motion.x, backend->width),
-				.y = normalized(ev.pointer_motion.y, backend->height),
-			};
-			wl_signal_emit_mutable(&backend->pointer.events.motion_absolute, &a);
-			struct wlr_pointer_motion_event r = {
-				.pointer = &backend->pointer,
-				.time_msec = time,
-				.delta_x = ev.pointer_motion.dx,
-				.delta_y = ev.pointer_motion.dy,
-				.unaccel_dx = ev.pointer_motion.dx,
-				.unaccel_dy = ev.pointer_motion.dy,
-			};
-			wl_signal_emit_mutable(&backend->pointer.events.motion, &r);
+		case ANLAND_DEVICE_IN_PTR_MOTION:
+			if (server.active_constraint && server.active_constraint->type ==
+					WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+				struct wlr_pointer_motion_event e = {
+					.pointer = &backend->pointer,
+					.time_msec = time,
+					.delta_x = ev.pointer_motion.dx,
+					.delta_y = ev.pointer_motion.dy,
+					.unaccel_dx = ev.pointer_motion.dx,
+					.unaccel_dy = ev.pointer_motion.dy,
+				};
+				wl_signal_emit_mutable(&backend->pointer.events.motion, &e);
+			} else {
+				struct wlr_pointer_motion_absolute_event e = {
+					.pointer = &backend->pointer,
+					.time_msec = time,
+					.x = normalized(ev.pointer_motion.x, backend->width),
+					.y = normalized(ev.pointer_motion.y, backend->height),
+				};
+				wl_signal_emit_mutable(&backend->pointer.events.motion_absolute, &e);
+			}
 			emit_pointer_frame(backend);
 			break;
-		}
 		case ANLAND_DEVICE_IN_PTR_BUTTON: {
+			bool pressed = ev.pointer_button.pressed;
+			if (!track_input_id(backend->pressed_buttons,
+					&backend->pressed_button_count, ev.pointer_button.button,
+					pressed)) {
+				drop_session(backend);
+				return 0;
+			}
 			struct wlr_pointer_button_event e = {
 				.pointer = &backend->pointer,
 				.time_msec = time,
 				.button = ev.pointer_button.button,
-				.state = ev.pointer_button.pressed ?
+				.state = pressed ?
 					WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED,
 			};
 			wlr_pointer_notify_button(&backend->pointer, &e);
@@ -834,6 +1052,11 @@ static int handle_input(int fd, uint32_t mask, void *data) {
 			double x = normalized(ev.touch.x, backend->width);
 			double y = normalized(ev.touch.y, backend->height);
 			if (ev.touch.action == ANLAND_DEVICE_ACTION_DOWN) {
+				if (!track_input_id(backend->touch_ids,
+						&backend->touch_count, (uint32_t)ev.touch.pointer_id, true)) {
+					drop_session(backend);
+					return 0;
+				}
 				struct wlr_touch_down_event e = {.touch = &backend->touch,
 					.time_msec = time, .touch_id = ev.touch.pointer_id,
 					.x = x, .y = y};
@@ -844,6 +1067,8 @@ static int handle_input(int fd, uint32_t mask, void *data) {
 					.x = x, .y = y};
 				wl_signal_emit_mutable(&backend->touch.events.motion, &e);
 			} else {
+				(void)track_input_id(backend->touch_ids,
+					&backend->touch_count, (uint32_t)ev.touch.pointer_id, false);
 				struct wlr_touch_up_event e = {.touch = &backend->touch,
 					.time_msec = time, .touch_id = ev.touch.pointer_id};
 				wl_signal_emit_mutable(&backend->touch.events.up, &e);
@@ -865,19 +1090,19 @@ static int handle_input(int fd, uint32_t mask, void *data) {
 			}
 			break;
 		case ANLAND_DEVICE_IN_CLIPBOARD:
-			if (!read_text_payload(backend, ev.type, ev.clipboard.size)) {
+			if (!begin_text_payload(backend, &ev, ev.clipboard.size)) {
 				drop_session(backend);
 				return 0;
 			}
 			break;
 		case ANLAND_DEVICE_IN_TEXT_INPUT:
-			if (!read_text_payload(backend, ev.type, ev.text_input.size)) {
+			if (!begin_text_payload(backend, &ev, ev.text_input.size)) {
 				drop_session(backend);
 				return 0;
 			}
 			break;
 		case ANLAND_DEVICE_IN_RESOURCE:
-			if (!consume_resource_fds(backend, ev.resource.fdnum)) {
+			if (!begin_resource_fds(backend, &ev)) {
 				drop_session(backend);
 				return 0;
 			}
@@ -886,6 +1111,15 @@ static int handle_input(int fd, uint32_t mask, void *data) {
 			break;
 		default:
 			break;
+		}
+		if (backend->pending_input != PENDING_INPUT_NONE) {
+			int pending_rc = progress_pending_input(backend);
+			if (pending_rc < 0) {
+				drop_session(backend);
+				return 0;
+			}
+			if (pending_rc == 0)
+				return 0;
 		}
 	}
 	if (ret < 0) {
@@ -917,11 +1151,12 @@ static bool attach_sources(struct anland_backend *backend) {
 
 static int reconnect(void *data) {
 	struct anland_backend *backend = data;
+	if (backend->destroying)
+		return 0;
 	(void)dispatch_scene_events(backend);
+	if (backend->session_lost || !anland_device_is_connected(backend->device))
+		drop_session(backend);
 	if (!anland_device_is_daemon_alive(backend->device)) {
-		producer_pre_release(backend);
-		anland_de_backend_drop_session(backend->producer);
-		(void)dispatch_scene_events(backend);
 		if (anland_de_backend_reopen(backend->producer, backend->socket_path) != 0) {
 			arm_reconnect(backend);
 			return 0;
@@ -935,6 +1170,7 @@ static int reconnect(void *data) {
 		drop_session(backend);
 		return 0;
 	}
+	backend->session_lost = false;
 	anland_audio_set_fd(anland_device_audio_fd(backend->device));
 	if (!dispatch_scene_events(backend)) {
 		drop_session(backend);
@@ -947,31 +1183,41 @@ static int reconnect(void *data) {
 static bool export_write_fence(struct wlr_buffer *buffer, int *out_fd) {
 	*out_fd = -1;
 	struct wlr_dmabuf_attributes attrs;
-	if (!wlr_buffer_get_dmabuf(buffer, &attrs) || attrs.n_planes < 1 || attrs.fd[0] < 0) {
-		return true;
-	}
+	if (!wlr_buffer_get_dmabuf(buffer, &attrs) || attrs.n_planes < 1 || attrs.fd[0] < 0)
+		return false;
 	struct dma_buf_export_sync_file sync = {.flags = DMA_BUF_SYNC_WRITE, .fd = -1};
 	if (ioctl(attrs.fd[0], DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync) == 0) {
 		*out_fd = sync.fd;
+		return true;
 	}
-	return true;
+	int error = errno;
+	if (sync.fd >= 0)
+		close(sync.fd);
+	return error == ENOTTY || error == ENOSYS || error == EOPNOTSUPP;
 }
 
 static bool present_buffer(struct anland_output *output, struct wlr_buffer *buffer) {
 	struct anland_backend *backend = output->backend;
-	if (!backend->have_target || backend->target.index >= output->buffer_count ||
-			!output->buffers[backend->target.index] ||
-			buffer != &output->buffers[backend->target.index]->base ||
-			output->committed) {
+	anland_de_target_t target;
+	if (output->active_commit ||
+			anland_de_backend_get_writable_target(backend->producer, &target) != 0 ||
+			target.generation != backend->session_generation ||
+			target.count != output->buffer_count || target.index >= target.count ||
+			!output->buffers[target.index] || output->buffers[target.index]->submitted ||
+			buffer != &output->buffers[target.index]->base) {
 		return false;
 	}
 	int fence_fd = -1;
 	if (!export_write_fence(buffer, &fence_fd)) {
+		drop_session(backend);
 		return false;
 	}
-	anland_layer_state_t state = {
+	struct anland_buffer *submitted = output->buffers[target.index];
+	wlr_buffer_lock(buffer);
+	submitted->submitted = true;
+	anland_layer_state_t layer = {
 		.layer_id = backend->layer,
-		.buffer_id = (uint64_t)backend->target.index + 1,
+		.buffer_id = (uint64_t)target.index + 1,
 		.destination = {
 			.x = 0,
 			.y = 0,
@@ -983,19 +1229,21 @@ static bool present_buffer(struct anland_output *output, struct wlr_buffer *buff
 		.acquire_fence_fd = fence_fd,
 	};
 	uint64_t commit_id = 0;
-	if (anland_de_backend_commit(backend->producer, &state, 1, &commit_id) != 0) {
-		if (fence_fd >= 0) close(fence_fd);
+	if (anland_de_backend_commit(backend->producer, &layer, 1, &commit_id) != 0) {
+		if (fence_fd >= 0)
+			close(fence_fd);
+		submitted->submitted = false;
+		wlr_buffer_unlock(buffer);
 		return false;
 	}
-	if (fence_fd >= 0) close(fence_fd);
+	if (fence_fd >= 0)
+		close(fence_fd);
+	output->active_commit = commit_id;
+	output->active_commit_seq = output->base.commit_seq + 1;
 	if (anland_de_backend_present(backend->producer) != 0) {
 		drop_session(backend);
 		return false;
 	}
-	output->committed = wlr_buffer_lock(buffer);
-	output->committed_buffer_id = state.buffer_id;
-	output->committed_commit_id = commit_id;
-	output->committed_commit_seq = output->base.commit_seq + 1;
 	return true;
 }
 
@@ -1015,11 +1263,18 @@ static bool output_test(struct wlr_output *base,
 			state->custom_mode.refresh != (int32_t)output->backend->refresh)) {
 		return false;
 	}
-	if ((state->committed & WLR_OUTPUT_STATE_BUFFER) &&
-			(!output->swapchain || !state->buffer || output->committed ||
-			!output->backend->have_target ||
-			!wlr_swapchain_has_buffer(output->swapchain, state->buffer))) {
-		return false;
+	if (state->committed & WLR_OUTPUT_STATE_BUFFER) {
+		anland_de_target_t target;
+		if (!output->swapchain || !state->buffer || output->active_commit ||
+				!wlr_swapchain_has_buffer(output->swapchain, state->buffer) ||
+				anland_de_backend_get_writable_target(output->backend->producer,
+					&target) != 0 ||
+				target.generation != output->backend->session_generation ||
+				target.count != output->buffer_count || target.index >= target.count ||
+				!output->buffers[target.index] || output->buffers[target.index]->submitted ||
+				state->buffer != &output->buffers[target.index]->base) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -1076,10 +1331,22 @@ static bool backend_start(struct wlr_backend *base) {
 
 static void backend_destroy(struct wlr_backend *base) {
 	struct anland_backend *backend = wl_container_of(base, backend, base);
+	backend->destroying = true;
 	if (backend->selection_listener_set) wl_list_remove(&backend->selection_listener.link);
 	if (backend->reconnect_source) wl_event_source_remove(backend->reconnect_source);
+	if (backend->frame_source) wl_event_source_remove(backend->frame_source);
+	if (backend->pump_source) wl_event_source_remove(backend->pump_source);
+	if (backend->input_source) wl_event_source_remove(backend->input_source);
 	backend->reconnect_source = NULL;
+	backend->frame_source = NULL;
+	backend->pump_source = NULL;
+	backend->input_source = NULL;
 	producer_pre_release(backend);
+	anland_de_backend_drop_session(backend->producer);
+	(void)dispatch_scene_events(backend);
+	reset_input(backend);
+	clear_pending_input(backend);
+	drop_buffers(backend);
 	if (backend->audio_started) anland_audio_stop();
 	if (backend->output_initialized) wlr_output_destroy(&backend->output.base);
 	wlr_keyboard_finish(&backend->keyboard);
@@ -1102,6 +1369,10 @@ static const struct wlr_backend_impl backend_impl = {
 	.destroy = backend_destroy,
 	.get_drm_fd = backend_get_drm_fd,
 };
+
+bool mango_anland_backend_is(struct wlr_backend *backend) {
+	return backend && backend->impl == &backend_impl;
+}
 
 struct wlr_backend *mango_anland_backend_create(struct wl_event_loop *loop,
 		const char *socket_path) {
@@ -1167,12 +1438,21 @@ struct wlr_backend *mango_anland_backend_create(struct wl_event_loop *loop,
 	wlr_pointer_init(&backend->pointer, &pointer_impl, "Anland pointer");
 	wlr_touch_init(&backend->touch, &touch_impl, "Anland touch");
 	backend->reconnect_source = wl_event_loop_add_timer(loop, reconnect, backend);
-	if (!backend->reconnect_source) goto fail_initialized;
+	backend->frame_source = wl_event_loop_add_timer(loop, frame_tick, backend);
+	backend->pump_source = wl_event_loop_add_timer(loop, pump_tick, backend);
+	backend->input_source = wl_event_loop_add_timer(loop, input_tick, backend);
+	if (!backend->reconnect_source || !backend->frame_source ||
+			!backend->pump_source || !backend->input_source)
+		goto fail_initialized;
 	anland_device_set_pre_release_cb(backend->device, producer_pre_release, backend);
 	anland_device_set_fallback_cb(backend->device, producer_fallback, backend);
 	return &backend->base;
 
 fail_initialized:
+	if (backend->reconnect_source) wl_event_source_remove(backend->reconnect_source);
+	if (backend->frame_source) wl_event_source_remove(backend->frame_source);
+	if (backend->pump_source) wl_event_source_remove(backend->pump_source);
+	if (backend->input_source) wl_event_source_remove(backend->input_source);
 	wlr_output_destroy(&backend->output.base);
 	wlr_keyboard_finish(&backend->keyboard);
 	wlr_pointer_finish(&backend->pointer);

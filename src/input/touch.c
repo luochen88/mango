@@ -6,6 +6,7 @@
 #include "mango/input/pointer.h"
 #include "mango/ipc/ipc.h"
 #include "mango/manage/client.h"
+#include "mango/manage/layer.h"
 #include "mango/manage/misc.h"
 #include "mango/manage/monitor.h"
 #include <linux/input-event-codes.h>
@@ -15,6 +16,7 @@
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_idle_notify_v1.h>
 #include <wlr/types/wlr_input_device.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_touch.h>
 
@@ -203,6 +205,21 @@ void handle_cursor_touch_down(struct wl_listener *listener, void *data) {
 		touch_drive_cursor(event->touch, event->touch_id, event->x, event->y);
 
 	if (point->touch_protocol) {
+		/* wl_touch does not imply keyboard focus. Select only on first down,
+		 * using the same client/layer policy as a pointer press. */
+		if (touch_point_count == 1 && !server.session_locked) {
+			LayerSurface *layer = NULL;
+			toplevel_from_wlr_surface(point->surface, &c, &layer);
+			if (c && c->scene && c->scene->node.enabled && c->mon &&
+					VISIBLEON(c, c->mon) &&
+					(!client_is_unmanaged(c) || client_wants_focus(c)))
+				client_focus(c, 1);
+			if (layer && !server.exclusive_focus &&
+					layer->layer_surface->current.keyboard_interactive ==
+						ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND)
+				layer_focus(layer);
+		}
+
 		// Touch protocol touch point: exit pointer emulation and clear pointer
 		// focus to avoid interference.
 		simulating_pointer_from_touch = false;

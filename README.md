@@ -89,11 +89,25 @@ Enable the backend explicitly when configuring Mango:
 ```sh
 meson setup build -Danland=enabled -Dxwayland=enabled
 meson compile -C build
+meson test -C build --print-errorlogs
 ```
 
 `ANLAND_SOCKET` opts into the backend; when unset, Mango uses its normal backend
 selection unchanged. `ANLAND_DRM_DEVICE` selects the render node (falling back to
-`WLR_RENDER_DRM_DEVICE`). A typical Anland session with MangoBar is:
+`WLR_RENDER_DRM_DEVICE`). The backend submits only the current writable Anland slot,
+keeps retained buffers independently from the active commit, and drains presented,
+dropped, and release outcomes before retiring resources. Input payloads are consumed
+incrementally with a bounded message deadline; disconnect cleanup synthesizes key,
+button, and touch releases. Direct text-input-v3 commits are accepted only for the
+enabled focused client and are rejected during an IME keyboard grab. The CPU-only
+`anland-backend` and `text-input` Meson tests exercise input framing, clipboard
+teardown re-entry, release-fence cleanup, direct text input, and IME restart replay.
+
+Build and protocol smoke validation can run against a unique private daemon socket;
+GPU DMA-BUF fence import, compositor scanout, and visual static-scene output require
+hardware validation separately.
+
+A typical Anland session with MangoBar is:
 
 ```sh
 export ANLAND_SOCKET=/run/display.sock
